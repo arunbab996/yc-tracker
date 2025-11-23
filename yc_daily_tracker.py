@@ -132,7 +132,7 @@ def get_or_create_sheet(gc, sheet_id, create_if_missing=False, sheet_title=None)
     return sh, ws
 
 def main():
-    batch_slug = os.environ.get("BATCH_SLUG", "winter-2026")
+    batch_slug = (os.environ.get("BATCH_SLUG", "winter-2026") or "winter-2026").strip()
     sheet_id = os.environ.get("SHEET_ID")
     sa_json = os.environ.get("GCP_SA_KEY_JSON")
     # Basic validation
