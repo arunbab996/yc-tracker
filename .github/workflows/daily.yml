@@ -2,13 +2,17 @@ name: Daily YC Tracker
 
 on:
   schedule:
-    - cron: '0 2 * * *'  # runs daily at 2 AM UTC
+    - cron: '0 2 * * *'  # runs daily at 02:00 UTC
   workflow_dispatch:
+    inputs:
+      debug:
+        description: 'Set to true to run debug mode (prints repo listing & env info)'
+        required: false
+        default: 'false'
 
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -23,16 +27,45 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4 python-dateutil gspread google-auth
 
-      - name: Run YC tracker
+      - name: Run YC tracker (normal)
+        if: ${{ inputs.debug == 'false' }}
         env:
           GCP_SA_KEY_JSON: ${{ secrets.GCP_SA_KEY_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           BATCH_SLUG: ${{ secrets.BATCH_SLUG }}
+          REQUEST_DELAY: '0.8'
         run: |
+          # write the service account key file (keeps secret out of logs)
           echo "$GCP_SA_KEY_JSON" > sa.json
+          # run the tracker script
           python yc_daily_tracker.py
 
-      - name: Upload results
+      - name: Run YC tracker (debug)
+        if: ${{ inputs.debug == 'true' }}
+        env:
+          GCP_SA_KEY_JSON: ${{ secrets.GCP_SA_KEY_JSON }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          BATCH_SLUG: ${{ secrets.BATCH_SLUG }}
+          REQUEST_DELAY: '0.8'
+        run: |
+          echo "=== DEBUG START ==="
+          echo "Working directory: $(pwd)"
+          echo "Repo files (top-level):"
+          ls -la
+          echo "Repository file tree (up to depth 2):"
+          find . -maxdepth 2 -type f -print || true
+          echo "Python version:"
+          python --version || true
+          echo "Writing sa.json length (bytes):"
+          echo "$GCP_SA_KEY_JSON" > sa.json
+          wc -c sa.json || true
+          echo "Now running yc_daily_tracker.py (debug output will appear below):"
+          # run and capture exit code — prints stdout/stderr
+          python yc_daily_tracker.py
+          echo "EXIT CODE: $?"
+          echo "=== DEBUG END ==="
+
+      - name: Upload results artifact
         uses: actions/upload-artifact@v4
         with:
           name: yc-results
