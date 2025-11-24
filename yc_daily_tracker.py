@@ -1,336 +1,278 @@
 #!/usr/bin/env python3
 """
-yc_daily_tracker.py
-
-- Fetches YC batch companies from yc-oss JSON
-- Scrapes YC website companies list for the same batch (merges in any site-only results)
-- Detects new companies vs seen_slugs.json
-- Scrapes founders (LinkedIn) from each company's YC page
-- Appends new rows to a Google Sheet (service-account based)
-- Writes CSV snapshot to ./results/ and updates seen_slugs.json
-
-Environment variables required in CI:
- - GCP_SA_KEY_JSON  -> full JSON content of the service account key
- - SHEET_ID         -> Google Sheet ID
- - BATCH_SLUG       -> batch slug (eg. winter-2026)
-
-Optional:
- - REQUEST_DELAY    -> seconds to sleep between requests (default 0.8)
-
-Local CSV preview (useful in this environment for debugging):
- - LOCAL_CSV_PREVIEW points to the uploaded CSV in this environment:
-   /mnt/data/yc_winter2025_sample.csv
+YC Daily Tracker – full version with:
+- yc-oss JSON source
+- website scraper
+- Playwright JS-render fallback
+- Google Sheet append
+- seen_slugs.json state tracking
 """
 
 import os
 import json
-import time
 import csv
-import re
-from pathlib import Path
-from datetime import datetime, timezone
-from dateutil import tz
+import time
 import requests
+import re
+from datetime import datetime
 from bs4 import BeautifulSoup
 
-# Google libs
-import gspread
-from google.oauth2.service_account import Credentials
+# Try to import Playwright
+try:
+    from playwright.sync_api import sync_playwright
+    _PLAYWRIGHT_AVAILABLE = True
+except Exception:
+    _PLAYWRIGHT_AVAILABLE = False
 
-# Config
-WORKDIR = Path("results")
-WORKDIR.mkdir(exist_ok=True)
-STATE_FILE = Path("seen_slugs.json")
-API_BATCH_BASE = "https://yc-oss.github.io/api/batches/{batch}.json"
-HEADERS = {"User-Agent": "YC-Daily-Tracker/1.0 (ci)"}
-REQUEST_DELAY = float(os.environ.get("REQUEST_DELAY", "0.8"))
 
-# Path to the CSV you uploaded in this environment (for local preview/testing)
-LOCAL_CSV_PREVIEW = "/mnt/data/yc_winter2025_sample.csv"
-
-# ---------------------------
+# -------------------------------
 # Helpers
-# ---------------------------
-def safe_env(name, default=None):
-    v = os.environ.get(name, default)
-    if v is None:
-        return default
-    return v.strip()
-
-def load_seen():
-    if STATE_FILE.exists():
-        try:
-            return set(json.loads(STATE_FILE.read_text(encoding="utf-8")))
-        except Exception:
-            return set()
-    return set()
-
-def save_seen(slugs):
-    STATE_FILE.write_text(json.dumps(sorted(list(slugs)), indent=2), encoding="utf-8")
-
-def fetch_json_batch(batch_slug):
-    url = API_BATCH_BASE.format(batch=batch_slug)
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=20)
-        r.raise_for_status()
-        return r.json() or []
-    except Exception as e:
-        print("Warning: failed to fetch yc-oss JSON:", e)
-        return []
+# -------------------------------
 
 def site_batch_string_from_slug(batch_slug):
     """
-    Convert 'winter-2026' -> 'Winter%202026' (website expects capitalized season + space)
-    Works generically for patterns like 'winter-2026', 'summer-2025', etc.
+    Convert 'winter-2026' → 'Winter%202026'
     """
-    if not batch_slug:
-        return batch_slug
-    # allow either "winter-2026" or "winter 2026" variants
-    s = batch_slug.strip()
-    s = s.replace("%20", " ").replace("-", " ")
-    parts = s.split()
-    if len(parts) >= 2:
-        season = parts[0].capitalize()
-        year = parts[1]
-        return f"{season}%20{year}"
-    return batch_slug
+    season, year = batch_slug.split("-")
+    return season.capitalize() + "%20" + year
+
+
+def load_seen_slugs(path="seen_slugs.json"):
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_seen_slugs(data, path="seen_slugs.json"):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+# -------------------------------
+# Fetch from yc-oss JSON
+# -------------------------------
+
+def fetch_yc_oss_json(batch_slug):
+    base_url = f"https://yc-oss.github.io/api/batches/{batch_slug}.json"
+    print(f"Fetching yc-oss JSON from: {base_url}")
+    try:
+        r = requests.get(base_url, timeout=15)
+        if r.status_code != 200:
+            print("YC-OSS JSON returned status:", r.status_code)
+            return {}
+        data = r.json()
+        result = {}
+        for c in data.get("companies", []):
+            slug = c.get("slug")
+            if slug:
+                result[slug] = {
+                    "slug": slug,
+                    "name": c.get("name", ""),
+                    "one_liner": c.get("one_liner", ""),
+                    "url": f"https://www.ycombinator.com/companies/{slug}"
+                }
+        return result
+    except Exception as e:
+        print("Error fetching yc-oss JSON:", e)
+        return {}
+
+
+# -------------------------------
+# Static scraper (non-JS)
+# -------------------------------
 
 def scrape_yc_site(batch_slug):
-    """
-    Scrape the YC companies listing page for the given batch.
-    Returns a dict slug -> minimal company dict.
-    Uses the website's batch string mapping (e.g. 'Winter%202026').
-    Note: YC may client-side render; this tries static scraping first.
-    """
     site_batch = site_batch_string_from_slug(batch_slug)
-    site_url = f"https://www.ycombinator.com/companies?batch={site_batch}"
-    print("Scraping YC site:", site_url)
+    url = f"https://www.ycombinator.com/companies?batch={site_batch}"
+    print("Scraping YC site:", url)
     results = {}
     try:
-        r = requests.get(site_url, headers=HEADERS, timeout=20)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        # find anchors that link to /companies/<slug>
+        resp = requests.get(url, timeout=15)
+        soup = BeautifulSoup(resp.text, "html.parser")
         anchors = soup.select('a[href*="/companies/"]')
+        for a in anchors:
+            href = a.get('href') or ""
+            m = re.search(r'/companies/([^/?#]+)', href)
+            if not m:
+                continue
+            slug = m.group(1).strip()
+            if slug not in results:
+                name = a.get_text(" ", strip=True) or ""
+                results[slug] = {"slug": slug, "name": name, "url": href}
+        return results
+    except Exception as e:
+        print("Error scraping site:", e)
+        return {}
+
+
+# -------------------------------
+# Playwright fallback
+# -------------------------------
+
+def scrape_site_with_playwright(batch_slug, timeout=20000):
+    if not _PLAYWRIGHT_AVAILABLE:
+        print("Playwright not available – skipping fallback.")
+        return {}
+
+    site_batch = site_batch_string_from_slug(batch_slug)
+    url = f"https://www.ycombinator.com/companies?batch={site_batch}"
+    print("Playwright rendering:", url)
+    results = {}
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(url, timeout=timeout)
+            page.wait_for_timeout(2000)
+            html = page.content()
+            browser.close()
+
+        soup = BeautifulSoup(html, "html.parser")
+        anchors = soup.select('a[href*="/companies/"]')
+
         for a in anchors:
             href = a.get("href") or ""
             m = re.search(r'/companies/([^/?#]+)', href)
             if not m:
                 continue
             slug = m.group(1).strip()
-            if not slug:
+            if slug in results:
                 continue
-            # company name (anchor text) and a best-effort one-liner
+
             name = a.get_text(" ", strip=True) or ""
-            one_liner = ""
             parent = a.parent
+            one_liner = ""
             if parent:
-                # collect small descriptive text near the anchor as heuristic
                 txt = parent.get_text(" ", strip=True)
-                # remove the name itself
-                if name:
-                    one_liner = txt.replace(name, "").strip()
-                else:
-                    one_liner = txt.strip()
-            yc_url = href if href.startswith("http") else ("https://www.ycombinator.com" + href)
-            results[slug] = {"slug": slug, "name": name, "one_liner": one_liner, "url": yc_url}
+                one_liner = txt.replace(name, "").strip()
+
+            full_url = href if href.startswith("http") else "https://www.ycombinator.com" + href
+
+            results[slug] = {
+                "slug": slug,
+                "name": name,
+                "one_liner": one_liner,
+                "url": full_url
+            }
+
+        return results
+
     except Exception as e:
-        print("Warning: static scraping YC site failed:", e)
-    return results
+        print("Playwright fallback failed:", e)
+        return {}
+
+
+# -------------------------------
+# Combine sources
+# -------------------------------
 
 def fetch_combined_batch(batch_slug):
-    """
-    Primary: yc-oss JSON
-    Secondary: scrape YC website and merge in any missing slugs (site-only)
-    Returns a list of company dicts.
-    """
-    print("Fetching yc-oss JSON for batch:", batch_slug)
-    companies = fetch_json_batch(batch_slug)
-    slug_map = {c.get("slug"): c for c in companies if c.get("slug")}
-    # scrape site and merge
+    slug_map = fetch_yc_oss_json(batch_slug)
+
+    # static site scrape
     site_map = scrape_yc_site(batch_slug)
-    added = 0
     for slug, comp in site_map.items():
         if slug not in slug_map:
             slug_map[slug] = comp
-            added += 1
-    if added:
-        print(f"Merged {added} site-only companies into batch list")
-    return list(slug_map.values())
 
-# ---------------------------
-# Founder extraction (unchanged, robust)
-# ---------------------------
-def parse_founders_from_yc_page(yc_company_url):
-    try:
-        r = requests.get(yc_company_url, headers=HEADERS, timeout=20)
-        r.raise_for_status()
-    except Exception as e:
-        print("Fetch failed for", yc_company_url, e)
-        return []
-    soup = BeautifulSoup(r.text, "html.parser")
-    linkedin_anchors = soup.select('a[href*="linkedin.com"]')
-    founders = []
-    seen_links = set()
-    for a in linkedin_anchors:
-        href = a.get("href")
-        if not href or href in seen_links:
-            continue
-        seen_links.add(href)
-        name = None
-        node = a
-        for _ in range(4):
-            node = node.parent
-            if node is None:
-                break
-            txt = node.get_text(" ", strip=True)
-            if txt and len(txt.split()) <= 6 and len(txt) < 120:
-                name = txt.strip()
-                break
-        founders.append({"name": name or "", "linkedin": href})
-    # fallback: look for heading with "Founder"
-    if not founders:
-        headers = soup.find_all(lambda tag: tag.name in ("h2","h3","h4") and "Founder" in tag.text)
-        if headers:
-            block = headers[0].find_next_sibling()
-            if block:
-                for a in block.find_all("a", href=True):
-                    if "linkedin.com" in a["href"]:
-                        founders.append({"name": a.get_text(strip=True), "linkedin": a["href"]})
-    # dedupe
-    unique = []
-    seen_keys = set()
-    for f in founders:
-        key = (f.get("name","").strip(), f.get("linkedin",""))
-        if key in seen_keys:
-            continue
-        seen_keys.add(key)
-        unique.append(f)
-    return unique
+    # Playwright fallback logic
+    force = os.environ.get("FORCE_PROCESS", "false").lower() == "true"
+    use_pw = os.environ.get("USE_PLAYWRIGHT", "false").lower() == "true"
 
-# ---------------------------
-# Google Sheets helper
-# ---------------------------
-def gsheet_client_from_service_account_json(sa_json_str):
-    info = json.loads(sa_json_str)
-    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    creds = Credentials.from_service_account_info(info, scopes=scopes)
-    return gspread.authorize(creds)
-
-def get_or_create_sheet(gc, sheet_id, create_if_missing=False, sheet_title=None):
-    try:
-        sh = gc.open_by_key(sheet_id)
-    except Exception as e:
-        if create_if_missing and sheet_title:
-            sh = gc.create(sheet_title)
+    if (not site_map) or force or use_pw:
+        if _PLAYWRIGHT_AVAILABLE:
+            pw_map = scrape_site_with_playwright(batch_slug)
+            added = 0
+            for slug, comp in pw_map.items():
+                if slug not in slug_map:
+                    slug_map[slug] = comp
+                    added += 1
+            if added:
+                print(f"Merged {added} companies from Playwright render")
         else:
-            raise
-    ws = sh.sheet1
-    header = ["checked_at_utc","slug","company_name","website","yc_url","company_linkedin","founders_json","one_liner"]
+            print("Playwright not available for fallback.")
+
+    return slug_map
+
+
+# -------------------------------
+# Google Sheets append
+# -------------------------------
+
+def append_to_sheet(row):
     try:
-        existing = ws.row_values(1)
-    except Exception:
-        existing = []
-    if existing != header:
-        try:
-            ws.update("A1", [header])
-        except Exception:
-            pass
-    return sh, ws
+        import gspread
+        from google.oauth2.service_account import Credentials
 
-# ---------------------------
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        creds = Credentials.from_service_account_file("sa.json", scopes=scopes)
+        client = gspread.authorize(creds)
+        sheet = client.open_by_key(os.environ["SHEET_ID"]).sheet1
+
+        sheet.append_row(row, value_input_option="RAW")
+        return True
+    except Exception as e:
+        print("Failed to append to sheet:", e)
+        return False
+
+
+# -------------------------------
+# Generate row for Google Sheet
+# -------------------------------
+
+def build_row(c):
+    return [
+        datetime.utcnow().isoformat(),
+        c.get("name", ""),
+        c.get("slug", ""),
+        c.get("one_liner", ""),
+        c.get("url", "")
+    ]
+
+
+# -------------------------------
 # Main
-# ---------------------------
-def main():
-    batch_slug = (safe_env("BATCH_SLUG") or "winter-2026").strip()
-    # allow a debug override to use the local CSV for preview (not used in CI)
-    use_local_preview = os.environ.get("USE_LOCAL_PREVIEW", "false").lower() in ("1","true","yes")
-    sheet_id = safe_env("SHEET_ID")
-    sa_json = os.environ.get("GCP_SA_KEY_JSON")  # do not strip; it's JSON
-    if not use_local_preview and (not sheet_id or not sa_json):
-        print("Missing SHEET_ID or GCP_SA_KEY_JSON environment variable (or set USE_LOCAL_PREVIEW=true for local CSV preview).")
-        # continue in local-preview mode if requested
-        if not use_local_preview:
-            return
+# -------------------------------
 
-    seen = load_seen()
+def main():
+    batch_slug = os.environ.get("BATCH_SLUG")
+    delay = float(os.environ.get("REQUEST_DELAY", "0.5"))
+    seen = load_seen_slugs()
+
     print("Loaded seen slugs:", len(seen))
 
-    if use_local_preview:
-        # quick local preview mode: read the uploaded CSV (no web calls)
-        csv_path = Path(LOCAL_CSV_PREVIEW)
-        if not csv_path.exists():
-            print("Local preview CSV not found at:", LOCAL_CSV_PREVIEW)
-            return
-        import csv as _csv
-        rows = []
-        with csv_path.open(encoding="utf-8") as f:
-            reader = _csv.DictReader(f)
-            for r in reader:
-                rows.append(r)
-        print("Loaded local CSV rows:", len(rows))
-        batch = rows
-    else:
-        # live fetch: combine JSON + site scraping
-        batch = fetch_combined_batch(batch_slug)
+    merged = fetch_combined_batch(batch_slug)
+    print("Total companies after merge:", len(merged))
 
-    print("Total companies obtained (merged):", len(batch))
+    new = [c for s, c in merged.items() if s not in seen]
+    print("New companies to process:", len(new))
 
-    # Determine new companies by slug
-    slugs_in_batch = [c.get("slug") for c in batch if c.get("slug")]
-    new_companies = [c for c in batch if c.get("slug") and c.get("slug") not in seen]
-    print("New companies to process:", len(new_companies))
+    # Write CSV output
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    os.makedirs("results", exist_ok=True)
+    csv_path = f"results/yc_new_{batch_slug}_{ts}.csv"
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["timestamp", "name", "slug", "one_liner", "url"])
+        for c in new:
+            w.writerow(build_row(c))
+    print("Wrote CSV:", csv_path)
 
-    if not new_companies:
-        print("No new companies. Exiting.")
-        return
+    # Append to sheet
+    for c in new:
+        row = build_row(c)
+        time.sleep(delay)
+        append_to_sheet(row)
+        seen[c["slug"]] = True
 
-    # connect to Google Sheets
-    gc = gsheet_client_from_service_account_json(sa_json)
-    sh, ws = get_or_create_sheet(gc, sheet_id, create_if_missing=False)
+    save_seen_slugs(seen)
+    print(f"Updated seen_slugs.json with {len(seen)} entries")
 
-    results = []
-    for company in new_companies:
-        slug = company.get("slug")
-        name = company.get("name","") or company.get("company_name","")
-        website = company.get("website","") or company.get("url","")
-        yc_url = company.get("url") or company.get("yc_url") or f"https://www.ycombinator.com/companies/{slug}"
-        one_liner = company.get("one_liner","") or company.get("one_liner","")
-        print("Processing:", name or slug, slug)
-        founders = parse_founders_from_yc_page(yc_url)
-        record = {
-            "checked_at_utc": datetime.now(timezone.utc).isoformat(),
-            "slug": slug,
-            "company_name": name,
-            "website": website,
-            "yc_url": yc_url,
-            "company_linkedin": "",
-            "founders_json": json.dumps(founders, ensure_ascii=False),
-            "one_liner": one_liner
-        }
-        results.append(record)
-        try:
-            row = [record[k] for k in ["checked_at_utc","slug","company_name","website","yc_url","company_linkedin","founders_json","one_liner"]]
-            ws.append_row(row, value_input_option='USER_ENTERED')
-        except Exception as e:
-            print("Failed to append row to sheet for", slug, ":", e)
-        seen.add(slug)
-        time.sleep(REQUEST_DELAY)
-
-    nowtag = datetime.now(tz=tz.tzlocal()).strftime("%Y%m%d_%H%M%S")
-    csv_path = WORKDIR / f"yc_new_{batch_slug}_{nowtag}.csv"
-    try:
-        with csv_path.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=["checked_at_utc","slug","company_name","website","yc_url","company_linkedin","founders_json","one_liner"])
-            writer.writeheader()
-            for r in results:
-                writer.writerow(r)
-        print("Wrote CSV:", csv_path)
-    except Exception as e:
-        print("Failed to write CSV:", e)
-
-    save_seen(seen)
-    print("Updated seen_slugs.json with", len(seen), "entries")
 
 if __name__ == "__main__":
     main()
