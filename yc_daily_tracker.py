@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-yc_daily_tracker.py — with UPSERT behavior:
-- fetch yc-oss JSON + site scrape + Playwright fallback
-- enrich company pages (name, website, one_liner, founders)
-- if slug exists in Google Sheet -> UPDATE that row with enriched data (upsert)
-- else -> APPEND
-- only mark slug as seen after successful upsert/append
+yc_daily_tracker.py — UPSERT + improved website heuristics
+
+Features:
+- Fetch yc-oss JSON, static scrape of YC companies page, Playwright JS-render fallback
+- Enrich company pages to extract: company_name, website (better heuristics), one_liner, founders_json
+- UPSERT behavior: update existing sheet row if slug exists, otherwise append
+- Mark slugs as seen only after successful upsert/append
+- Writes canonical CSV snapshot to results/
 """
 
 import os
@@ -17,15 +19,16 @@ import re
 from datetime import datetime, timezone
 from bs4 import BeautifulSoup
 
-# Try Playwright
+# Playwright optional import
 try:
     from playwright.sync_api import sync_playwright
     _PLAYWRIGHT_AVAILABLE = True
 except Exception:
     _PLAYWRIGHT_AVAILABLE = False
 
-# Local preview CSV
+# Local preview CSV path (uploaded)
 LOCAL_CSV_PREVIEW = "/mnt/data/yc_winter2025_sample.csv"
+
 WORKDIR = "results"
 os.makedirs(WORKDIR, exist_ok=True)
 
@@ -42,7 +45,7 @@ SHEET_HEADER = [
 
 SEEN_PATH = "seen_slugs.json"
 
-# ---------- helpers ----------
+# ---------- utilities ----------
 def now_iso_utc():
     return datetime.now(timezone.utc).isoformat()
 
@@ -197,7 +200,7 @@ def fetch_merged_batch(batch_slug):
             print(f"Merged {added} entries from Playwright-rendered page")
     return slug_map
 
-# ---------- enrichment ----------
+# ---------- enrichment with improved website heuristic ----------
 def enrich_from_yc_company_page(comp):
     slug = comp.get("slug")
     yc_url = comp.get("url") or f"https://www.ycombinator.com/companies/{slug}"
@@ -206,7 +209,10 @@ def enrich_from_yc_company_page(comp):
         r = requests.get(yc_url, headers=headers, timeout=12)
         if r.status_code != 200:
             return comp
-        soup = BeautifulSoup(r.text, "html.parser")
+        html = r.text
+        soup = BeautifulSoup(html, "html.parser")
+
+        # 1) company name: og:title -> h1
         og_title = soup.find("meta", property="og:title")
         if og_title and og_title.get("content"):
             comp["name"] = og_title.get("content").strip()
@@ -214,49 +220,107 @@ def enrich_from_yc_company_page(comp):
             h1 = soup.find(["h1","h2"])
             if h1 and h1.get_text(strip=True):
                 comp["name"] = h1.get_text(" ", strip=True)
+
+        # 2) one_liner: meta description or short p
         meta_desc = soup.find("meta", attrs={"name":"description"}) or soup.find("meta", property="og:description")
         if meta_desc and meta_desc.get("content"):
             comp["one_liner"] = meta_desc.get("content").strip()
         else:
             p = soup.find("p")
-            if p and p.get_text(strip=True): comp["one_liner"] = p.get_text(" ", strip=True)[:300]
+            if p and p.get_text(strip=True):
+                comp["one_liner"] = p.get_text(" ", strip=True)[:300]
+
+        # 3) website: improved heuristic to avoid startupschool / tracking links
         found_website = comp.get("website") or ""
         if not found_website:
             anchors = soup.find_all("a", href=True)
+            candidates = []
+            # domains to deprioritize entirely (blacklist)
+            blacklist_domains = ("ycombinator.com","linkedin.com","twitter.com","facebook.com","instagram.com","startupschool.org")
             for a in anchors:
-                href = a["href"]
-                if "ycombinator.com" in href or "linkedin.com" in href: continue
-                if href.startswith("mailto:") or href.startswith("#"): continue
-                if href.startswith("http"):
-                    found_website = href
+                href = a["href"].strip()
+                if not href:
+                    continue
+                if href.startswith("mailto:") or href.startswith("#"):
+                    continue
+                if href.startswith("//"):
+                    href = "https:" + href
+                if not href.startswith("http"):
+                    continue
+                # check if it's a noisy domain
+                is_low = False
+                for d in blacklist_domains:
+                    if d in href:
+                        is_low = True
+                        break
+                if is_low:
+                    candidates.append(("low", href))
+                else:
+                    candidates.append(("high", href))
+            # scoring: prefer high links that contain slug or name tokens
+            chosen = None
+            slug_token = (slug or "").lower()
+            name = (comp.get("name") or "").lower()
+            name_tokens = [t for t in re.split(r'\W+', name) if len(t) > 2]
+            for typ, href in candidates:
+                if typ != "high":
+                    continue
+                if slug_token and slug_token in href:
+                    chosen = href
                     break
-            if not found_website:
+                for t in name_tokens:
+                    if t and (t in href):
+                        chosen = href
+                        break
+                if chosen:
+                    break
+            if not chosen:
+                # pick first high if available
+                for typ, href in candidates:
+                    if typ == "high":
+                        chosen = href
+                        break
+            if not chosen:
+                # fallback pick a low candidate which is not startupschool tracking or utm-heavy link
+                for typ, href in candidates:
+                    if typ == "low" and "startupschool.org" not in href and "utm_" not in href:
+                        chosen = href
+                        break
+            # last resort: canonical link
+            if not chosen:
                 can = soup.find("link", rel="canonical")
                 if can and can.get("href") and "ycombinator.com" not in can.get("href"):
-                    found_website = can.get("href")
+                    chosen = can.get("href")
+            found_website = chosen or ""
         comp["website"] = found_website or comp.get("website","")
+
+        # 4) founders_json: find linkedin anchors and nearby text
         founders = []
         linkedin_anchors = soup.select('a[href*="linkedin.com"]')
         seen_links = set()
         for a in linkedin_anchors:
             href = a.get("href")
-            if not href or href in seen_links: continue
+            if not href or href in seen_links:
+                continue
             seen_links.add(href)
             name_guess = a.get_text(" ", strip=True)
             node = a
             for _ in range(3):
                 node = node.parent
-                if node is None: break
+                if node is None:
+                    break
                 txt = node.get_text(" ", strip=True)
                 if txt and len(txt.split()) < 8 and len(txt) < 120:
                     name_guess = txt.strip()
                     break
             founders.append({"name": name_guess or "", "linkedin": href})
+        # dedupe
         unique = []
         seenf = set()
         for f in founders:
             key = f.get("linkedin")
-            if key in seenf: continue
+            if key in seenf:
+                continue
             seenf.add(key)
             unique.append(f)
         comp["founders_json"] = json.dumps(unique, ensure_ascii=False)
@@ -265,7 +329,7 @@ def enrich_from_yc_company_page(comp):
         print("Warning: enrichment failed for", slug, e)
         return comp
 
-# ---------- Google Sheets (upsert) ----------
+# ---------- Google Sheets upsert helpers ----------
 def get_gsheet_client_from_sa_json(sa_json_str):
     try:
         from google.oauth2.service_account import Credentials
@@ -287,11 +351,6 @@ def get_gsheet_client_from_sa_json(sa_json_str):
             raise RuntimeError("Failed building gspread client: " + str(e) + " / " + str(e2))
 
 def read_existing_sheet_slugs_and_row(gc, sheet_id):
-    """
-    Returns:
-      - slugs_set: set of slugs
-      - slug_to_row: dict slug -> row_index (1-based)
-    """
     try:
         sh = gc.open_by_key(sheet_id)
         ws = sh.sheet1
@@ -304,7 +363,6 @@ def read_existing_sheet_slugs_and_row(gc, sheet_id):
         else:
             idx = 2
         vals = ws.col_values(idx)
-        # vals includes header at index 0
         slugs = {}
         for i, v in enumerate(vals[1:], start=2):
             s = v.strip()
@@ -316,13 +374,9 @@ def read_existing_sheet_slugs_and_row(gc, sheet_id):
         return set(), {}
 
 def update_sheet_row_by_index(gc, sheet_id, row_index, values):
-    """
-    Overwrite the row at row_index with provided values (list) matching SHEET_HEADER.
-    """
     try:
         sh = gc.open_by_key(sheet_id)
         ws = sh.sheet1
-        # build A1 range for the row, starting at column A
         start_col = "A"
         end_col = chr(ord("A") + len(values) - 1)
         rng = f"{start_col}{row_index}:{end_col}{row_index}"
@@ -392,19 +446,15 @@ def main():
     else:
         print("SHEET_ID or GCP_SA_KEY_JSON missing; sheet dedupe skipped.")
 
-    # Build final list to process: those not in seen OR we want to force update for some reason
-    # Note: we will upsert if slug exists in sheet (update row), otherwise append.
+    # Decide which to process: skip seen; we upsert only for new (not seen)
     final_candidates = []
     for comp in candidates:
         slug = comp.get("slug")
         if not slug: continue
-        if slug in seen:
-            # Skip, but if sheet has an entry that looks malformed you could still force update via FORCE_PROCESS
-            continue
+        if slug in seen: continue
         final_candidates.append(comp)
 
     print("Candidates after seen dedupe:", len(final_candidates))
-
     if not final_candidates:
         print("No new companies to process (after seen dedupe). Exiting.")
         save_seen(seen)
@@ -432,7 +482,6 @@ def main():
             "one_liner": one_liner
         }
 
-        # prepare values in header order
         values = [row_obj[h] for h in SHEET_HEADER]
 
         upserted = False
@@ -453,13 +502,12 @@ def main():
                 print("Sheet upsert error for", slug, e)
                 upserted = False
         else:
-            # If no sheet available, treat as appended (local debug)
-            upserted = True
+            upserted = True  # treat as appended in local debug mode
 
         if upserted:
             seen.add(slug)
             existing_sheet_slugs.add(slug)
-            # if appended, we don't know the row index; it's fine
+            # note: if appended we don't know new row index, that's fine
         else:
             print("Failed to upsert for", slug, "— will not mark as seen")
 
