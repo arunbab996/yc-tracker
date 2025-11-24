@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-yc_daily_tracker.py — improved enrichment for company page data:
-- merges yc-oss JSON + site scrape + Playwright fallback
-- enriches each company by scraping its YC company page to extract:
-    - proper company_name (og:title / h1 fallback)
-    - website (external link or meta tags)
-    - one_liner (meta description / visible tagline)
-    - founders_json (linkedin + nearby name text)
-- retains sheet dedupe and seen_slugs behavior
+yc_daily_tracker.py — with UPSERT behavior:
+- fetch yc-oss JSON + site scrape + Playwright fallback
+- enrich company pages (name, website, one_liner, founders)
+- if slug exists in Google Sheet -> UPDATE that row with enriched data (upsert)
+- else -> APPEND
+- only mark slug as seen after successful upsert/append
 """
 
 import os
@@ -19,16 +17,15 @@ import re
 from datetime import datetime, timezone
 from bs4 import BeautifulSoup
 
-# Playwright import (optional)
+# Try Playwright
 try:
     from playwright.sync_api import sync_playwright
     _PLAYWRIGHT_AVAILABLE = True
 except Exception:
     _PLAYWRIGHT_AVAILABLE = False
 
-# Local preview CSV path you uploaded:
+# Local preview CSV
 LOCAL_CSV_PREVIEW = "/mnt/data/yc_winter2025_sample.csv"
-
 WORKDIR = "results"
 os.makedirs(WORKDIR, exist_ok=True)
 
@@ -45,9 +42,7 @@ SHEET_HEADER = [
 
 SEEN_PATH = "seen_slugs.json"
 
-# ------------
-# Helpers
-# ------------
+# ---------- helpers ----------
 def now_iso_utc():
     return datetime.now(timezone.utc).isoformat()
 
@@ -72,9 +67,7 @@ def save_seen(seen_set):
     except Exception as e:
         print("Warning: failed to write seen_slugs.json:", e)
 
-# ------------
-# YC sources
-# ------------
+# ---------- YC sources ----------
 def site_batch_string_from_slug(batch_slug):
     s = (batch_slug or "").strip()
     s = s.replace("%20", " ").replace("-", " ")
@@ -93,12 +86,10 @@ def fetch_yc_oss_json(batch_slug):
         r.raise_for_status()
         payload = r.json()
         companies = []
-        # payload may be list or dict
         if isinstance(payload, dict):
             if "companies" in payload and isinstance(payload["companies"], list):
                 companies = payload["companies"]
             else:
-                # try find an inner list
                 for v in payload.values():
                     if isinstance(v, list):
                         companies = v
@@ -108,11 +99,10 @@ def fetch_yc_oss_json(batch_slug):
         out = {}
         for c in companies:
             slug = c.get("slug") or (c.get("name","").lower().replace(" ", "-"))
-            if not slug:
-                continue
+            if not slug: continue
             out[slug] = {
                 "slug": slug,
-                "name": c.get("name") or c.get("company_name") or "",
+                "name": c.get("name") or "",
                 "one_liner": c.get("one_liner") or c.get("tagline") or "",
                 "url": c.get("url") or f"https://www.ycombinator.com/companies/{slug}",
                 "website": c.get("website") or c.get("homepage") or ""
@@ -145,7 +135,7 @@ def scrape_yc_site(batch_slug):
             results[slug] = {"slug": slug, "name": name, "one_liner": "", "url": full, "website": ""}
         return results
     except Exception as e:
-        print("Warning: static scraping YC site failed:", e)
+        print("Warning: static scraping failed:", e)
         return {}
 
 def scrape_with_playwright(batch_slug, timeout=20000):
@@ -184,7 +174,7 @@ def scrape_with_playwright(batch_slug, timeout=20000):
             results[slug] = {"slug": slug, "name": name, "one_liner": one_liner, "url": full, "website": ""}
         return results
     except Exception as e:
-        print("Warning: Playwright render failed:", e)
+        print("Playwright fallback failed:", e)
         return {}
 
 def fetch_merged_batch(batch_slug):
@@ -207,27 +197,16 @@ def fetch_merged_batch(batch_slug):
             print(f"Merged {added} entries from Playwright-rendered page")
     return slug_map
 
-# ------------
-# Enrichment from YC company page
-# ------------
+# ---------- enrichment ----------
 def enrich_from_yc_company_page(comp):
-    """
-    Given a company dict with keys slug and url, fetch the YC company page and try to
-    extract: company_name, website (external), one_liner, founders (linkedin links with nearby text).
-    This enriches the dict in-place and returns it.
-    """
     slug = comp.get("slug")
     yc_url = comp.get("url") or f"https://www.ycombinator.com/companies/{slug}"
     headers = {"User-Agent": "YC-Daily-Tracker/1.0"}
     try:
         r = requests.get(yc_url, headers=headers, timeout=12)
         if r.status_code != 200:
-            # nothing to do
             return comp
-        html = r.text
-        soup = BeautifulSoup(html, "html.parser")
-
-        # 1) company name: try og:title, then h1, then anchor text already present
+        soup = BeautifulSoup(r.text, "html.parser")
         og_title = soup.find("meta", property="og:title")
         if og_title and og_title.get("content"):
             comp["name"] = og_title.get("content").strip()
@@ -235,78 +214,58 @@ def enrich_from_yc_company_page(comp):
             h1 = soup.find(["h1","h2"])
             if h1 and h1.get_text(strip=True):
                 comp["name"] = h1.get_text(" ", strip=True)
-
-        # 2) one_liner: meta description or visible tagline
         meta_desc = soup.find("meta", attrs={"name":"description"}) or soup.find("meta", property="og:description")
         if meta_desc and meta_desc.get("content"):
             comp["one_liner"] = meta_desc.get("content").strip()
         else:
-            # fallback: find short text near hero or description
-            # heuristics: look for <p> inside a main/section near top
             p = soup.find("p")
-            if p and p.get_text(strip=True):
-                comp["one_liner"] = p.get_text(" ", strip=True)[:300]
-
-        # 3) website: prefer external anchor (not ycombinator, not linkedin)
+            if p and p.get_text(strip=True): comp["one_liner"] = p.get_text(" ", strip=True)[:300]
         found_website = comp.get("website") or ""
         if not found_website:
             anchors = soup.find_all("a", href=True)
             for a in anchors:
                 href = a["href"]
-                if "ycombinator.com" in href or "linkedin.com" in href:
-                    continue
-                # skip mailto or anchors
-                if href.startswith("mailto:") or href.startswith("#"):
-                    continue
+                if "ycombinator.com" in href or "linkedin.com" in href: continue
+                if href.startswith("mailto:") or href.startswith("#"): continue
                 if href.startswith("http"):
                     found_website = href
                     break
-            # also check meta og:url or canonical for potential external pointer
             if not found_website:
                 can = soup.find("link", rel="canonical")
                 if can and can.get("href") and "ycombinator.com" not in can.get("href"):
                     found_website = can.get("href")
         comp["website"] = found_website or comp.get("website","")
-
-        # 4) founders_json: collect linkedin anchors and try to get nearby text/names
         founders = []
         linkedin_anchors = soup.select('a[href*="linkedin.com"]')
         seen_links = set()
         for a in linkedin_anchors:
             href = a.get("href")
-            if not href or href in seen_links:
-                continue
+            if not href or href in seen_links: continue
             seen_links.add(href)
             name_guess = a.get_text(" ", strip=True)
-            # look up to 3 parent levels for a textual name
             node = a
             for _ in range(3):
                 node = node.parent
-                if node is None:
-                    break
+                if node is None: break
                 txt = node.get_text(" ", strip=True)
                 if txt and len(txt.split()) < 8 and len(txt) < 120:
                     name_guess = txt.strip()
                     break
             founders.append({"name": name_guess or "", "linkedin": href})
-        # dedupe founders by linkedin url
         unique = []
         seenf = set()
         for f in founders:
             key = f.get("linkedin")
-            if key in seenf:
-                continue
+            if key in seenf: continue
             seenf.add(key)
             unique.append(f)
         comp["founders_json"] = json.dumps(unique, ensure_ascii=False)
         return comp
     except Exception as e:
-        print("Warning: failed to enrich from YC company page for", slug, e)
+        print("Warning: enrichment failed for", slug, e)
         return comp
 
-# ------------
-# Google Sheets helpers
-# ------------
+# ---------- Google Sheets (upsert) ----------
 def get_gsheet_client_from_sa_json(sa_json_str):
     try:
         from google.oauth2.service_account import Credentials
@@ -319,7 +278,6 @@ def get_gsheet_client_from_sa_json(sa_json_str):
         creds = Credentials.from_service_account_info(info, scopes=scopes)
         return __import__("gspread").authorize(creds)
     except Exception as e:
-        # fallback: try reading sa.json file if written
         try:
             from google.oauth2.service_account import Credentials as C2
             import gspread as g2
@@ -328,38 +286,63 @@ def get_gsheet_client_from_sa_json(sa_json_str):
         except Exception as e2:
             raise RuntimeError("Failed building gspread client: " + str(e) + " / " + str(e2))
 
-def read_existing_sheet_slugs(gc, sheet_id):
+def read_existing_sheet_slugs_and_row(gc, sheet_id):
+    """
+    Returns:
+      - slugs_set: set of slugs
+      - slug_to_row: dict slug -> row_index (1-based)
+    """
     try:
         sh = gc.open_by_key(sheet_id)
         ws = sh.sheet1
         header = ws.row_values(1)
         if not header:
-            return set()
+            return set(), {}
         lower = [h.strip().lower() for h in header]
         if "slug" in lower:
             idx = lower.index("slug") + 1
         else:
             idx = 2
         vals = ws.col_values(idx)
-        slugs = set(v.strip() for v in vals[1:] if v.strip())
-        return slugs
+        # vals includes header at index 0
+        slugs = {}
+        for i, v in enumerate(vals[1:], start=2):
+            s = v.strip()
+            if s:
+                slugs[s] = i
+        return set(slugs.keys()), slugs
     except Exception as e:
         print("Warning: couldn't read sheet slugs:", e)
-        return set()
+        return set(), {}
 
-def append_row_to_sheet(gc, sheet_id, row_values):
+def update_sheet_row_by_index(gc, sheet_id, row_index, values):
+    """
+    Overwrite the row at row_index with provided values (list) matching SHEET_HEADER.
+    """
     try:
         sh = gc.open_by_key(sheet_id)
         ws = sh.sheet1
-        ws.append_row(row_values, value_input_option="USER_ENTERED")
+        # build A1 range for the row, starting at column A
+        start_col = "A"
+        end_col = chr(ord("A") + len(values) - 1)
+        rng = f"{start_col}{row_index}:{end_col}{row_index}"
+        ws.update(rng, [values])
+        return True
+    except Exception as e:
+        print("Failed to update row", row_index, ":", e)
+        return False
+
+def append_row_to_sheet(gc, sheet_id, values):
+    try:
+        sh = gc.open_by_key(sheet_id)
+        ws = sh.sheet1
+        ws.append_row(values, value_input_option="USER_ENTERED")
         return True
     except Exception as e:
         print("Failed to append row to sheet:", e)
         return False
 
-# ------------
-# Main
-# ------------
+# ---------- main ----------
 def main():
     BATCH_SLUG = safe_env("BATCH_SLUG", "winter-2026")
     SHEET_ID = safe_env("SHEET_ID")
@@ -371,7 +354,6 @@ def main():
     print("Loaded seen slugs:", len(seen))
 
     if USE_LOCAL_PREVIEW:
-        # load local CSV to simulate merged_map
         merged_map = {}
         if os.path.exists(LOCAL_CSV_PREVIEW):
             with open(LOCAL_CSV_PREVIEW, "r", encoding="utf-8") as f:
@@ -396,44 +378,43 @@ def main():
 
     candidates = [comp for slug, comp in merged_map.items() if slug]
 
-    # prepare sheet client and existing slugs
     existing_sheet_slugs = set()
+    slug_to_row = {}
     gc = None
     if SHEET_ID and GCP_SA_KEY_JSON:
         try:
             gc = get_gsheet_client_from_sa_json(GCP_SA_KEY_JSON)
-            existing_sheet_slugs = read_existing_sheet_slugs(gc, SHEET_ID)
+            existing_sheet_slugs, slug_to_row = read_existing_sheet_slugs_and_row(gc, SHEET_ID)
             print("Existing slugs in sheet:", len(existing_sheet_slugs))
         except Exception as e:
             print("Warning: could not connect to Google Sheets:", e)
             gc = None
     else:
-        print("SHEET_ID or GCP_SA_KEY_JSON missing; sheet dedupe will be skipped.")
+        print("SHEET_ID or GCP_SA_KEY_JSON missing; sheet dedupe skipped.")
 
-    final_new = []
+    # Build final list to process: those not in seen OR we want to force update for some reason
+    # Note: we will upsert if slug exists in sheet (update row), otherwise append.
+    final_candidates = []
     for comp in candidates:
         slug = comp.get("slug")
         if not slug: continue
         if slug in seen:
+            # Skip, but if sheet has an entry that looks malformed you could still force update via FORCE_PROCESS
             continue
-        if slug in existing_sheet_slugs:
-            seen.add(slug)
-            continue
-        final_new.append(comp)
+        final_candidates.append(comp)
 
-    print("New companies to process (after sheet & seen dedupe):", len(final_new))
-    if not final_new:
+    print("Candidates after seen dedupe:", len(final_candidates))
+
+    if not final_candidates:
+        print("No new companies to process (after seen dedupe). Exiting.")
         save_seen(seen)
-        print("No new companies. Exiting.")
         return
 
     output_rows = []
-    for comp in final_new:
+    for comp in final_candidates:
         slug = comp.get("slug")
         print("Processing:", slug)
-        # enrich by visiting YC company page (gets name, website, one_liner, founders_json)
         comp = enrich_from_yc_company_page(comp)
-
         name = comp.get("name") or ""
         website = comp.get("website") or ""
         yc_url = comp.get("url") or f"https://www.ycombinator.com/companies/{slug}"
@@ -450,26 +431,39 @@ def main():
             "founders_json": founders_json,
             "one_liner": one_liner
         }
-        output_rows.append(row_obj)
 
-        appended = False
+        # prepare values in header order
+        values = [row_obj[h] for h in SHEET_HEADER]
+
+        upserted = False
         if gc and SHEET_ID:
             try:
-                values = [row_obj[h] for h in SHEET_HEADER]
-                appended = append_row_to_sheet(gc, SHEET_ID, values)
+                if slug in existing_sheet_slugs and slug in slug_to_row:
+                    row_index = slug_to_row[slug]
+                    ok = update_sheet_row_by_index(gc, SHEET_ID, row_index, values)
+                    if ok:
+                        upserted = True
+                        print("Updated sheet row", row_index, "for", slug)
+                else:
+                    ok = append_row_to_sheet(gc, SHEET_ID, values)
+                    if ok:
+                        upserted = True
+                        print("Appended new row for", slug)
             except Exception as e:
-                print("Append error for", slug, e)
-                appended = False
+                print("Sheet upsert error for", slug, e)
+                upserted = False
         else:
-            appended = True  # no sheet configured -> treat as appended for local debug
+            # If no sheet available, treat as appended (local debug)
+            upserted = True
 
-        if appended:
-            print("Appended:", slug)
+        if upserted:
             seen.add(slug)
             existing_sheet_slugs.add(slug)
+            # if appended, we don't know the row index; it's fine
         else:
-            print("Failed to append:", slug, "will not mark as seen")
+            print("Failed to upsert for", slug, "— will not mark as seen")
 
+        output_rows.append(row_obj)
         time.sleep(REQUEST_DELAY)
 
     # write canonical CSV
