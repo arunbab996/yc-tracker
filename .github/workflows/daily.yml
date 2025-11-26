@@ -34,11 +34,15 @@ jobs:
           playwright install chromium
 
       - name: Prepare service account file
-        if: ${{ secrets.GCP_SA_KEY_JSON != '' }}
         run: |
-          echo "$GCP_SA_KEY_JSON" > sa.json
-        env:
-          GCP_SA_KEY_JSON: ${{ secrets.GCP_SA_KEY_JSON }}
+          # write SA JSON only if secret is provided
+          if [ -n "${{ secrets.GCP_SA_KEY_JSON }}" ]; then
+            echo "Writing sa.json from secret"
+            echo "${{ secrets.GCP_SA_KEY_JSON }}" > sa.json
+            wc -c sa.json || true
+          else
+            echo "GCP_SA_KEY_JSON secret not provided — skipping sa.json write"
+          fi
 
       - name: Run YC tracker (normal)
         if: ${{ inputs.debug == 'false' }}
