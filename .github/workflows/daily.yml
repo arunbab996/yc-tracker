@@ -2,31 +2,29 @@ name: Daily YC Tracker
 
 on:
   schedule:
-    - cron: "30 2 * * *"   # 02:30 UTC daily
+    - cron: "30 2 * * *"   # runs daily at 02:30 UTC (change if you want)
   workflow_dispatch:
     inputs:
       debug:
         description: "Run in debug mode"
+        required: false
         default: "false"
       force:
-        description: "Force process (ignore seen_slugs + enable Playwright)"
+        description: "Force process (enable Playwright & ignore seen state during debug runs)"
+        required: false
         default: "false"
 
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Set up job
-        run: echo "Starting YC Tracker..."
-
       - name: Checkout repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: 3.11
+          python-version: "3.11"
 
       - name: Install dependencies
         run: |
@@ -35,17 +33,29 @@ jobs:
           pip install playwright
           playwright install chromium
 
+      - name: Prepare service account file
+        if: ${{ secrets.GCP_SA_KEY_JSON != '' }}
+        run: |
+          echo "$GCP_SA_KEY_JSON" > sa.json
+        env:
+          GCP_SA_KEY_JSON: ${{ secrets.GCP_SA_KEY_JSON }}
+
       - name: Run YC tracker (normal)
         if: ${{ inputs.debug == 'false' }}
         env:
+          # required secrets
           GCP_SA_KEY_JSON: ${{ secrets.GCP_SA_KEY_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           BATCH_SLUG: ${{ secrets.BATCH_SLUG }}
           REQUEST_DELAY: "0.8"
-          FORCE_PROCESS: "false"            # keep false by default for scheduled runs
-          USE_PLAYWRIGHT: "true"            # ENABLE Playwright for scheduled runs
+          # Make scheduled runs render site (Playwright) by default so JS-rendered companies aren't missed
+          FORCE_PROCESS: "false"
+          USE_PLAYWRIGHT: "true"
         run: |
-          echo "$GCP_SA_KEY_JSON" > sa.json
+          # write sa.json if secret provided (redundant safe write)
+          if [ -n "$GCP_SA_KEY_JSON" ]; then
+            echo "$GCP_SA_KEY_JSON" > sa.json
+          fi
           python yc_daily_tracker.py
 
       - name: Run YC tracker (debug)
@@ -63,14 +73,27 @@ jobs:
           ls -la
           find . -maxdepth 2 -type f -print || true
           python --version
-          echo "$GCP_SA_KEY_JSON" > sa.json
-          wc -c sa.json || true
+          if [ -n "$GCP_SA_KEY_JSON" ]; then
+            echo "$GCP_SA_KEY_JSON" > sa.json
+            wc -c sa.json || true
+          fi
+          # run tracker (will print logs)
           python yc_daily_tracker.py
           echo "=== DEBUG END ==="
 
-       - name: Commit results & seen state to repo
+      - name: Upload results artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: yc-results
+          path: results/
+          if-no-files-found: warn
+
+      - name: Commit results & seen state to repo
         if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -e
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
@@ -84,20 +107,16 @@ jobs:
             git add data/latest.csv || true
           fi
 
-          # commit updated seen_slugs.json
+          # commit updated seen_slugs.json if present
           if [ -f seen_slugs.json ]; then
             git add seen_slugs.json || true
           fi
 
-          git commit -m "ci: update latest YC CSV & seen_slugs $(date -u +%Y%m%d_%H%M%S)" || echo "no changes to commit"
-          git push || echo "push failed"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
- 
-
-      - name: Upload results artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: yc-results
-          path: results/
-          if-no-files-found: warn
+          # Only commit if there are changes
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "ci: update latest YC CSV & seen_slugs $(date -u +%Y%m%d_%H%M%S)"
+            # push using the provided token
+            git push origin HEAD:${{ github.ref_name }} || echo "git push failed"
+          fi
