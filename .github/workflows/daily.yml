@@ -68,6 +68,33 @@ jobs:
           python yc_daily_tracker.py
           echo "=== DEBUG END ==="
 
+       - name: Commit results & seen state to repo
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # find newest CSV in results/
+          LATEST_CSV=$(ls -t results/yc_new_* 2>/dev/null | head -n1 || true)
+
+          # copy it to data/latest.csv
+          if [ -n "$LATEST_CSV" ]; then
+            mkdir -p data
+            cp "$LATEST_CSV" data/latest.csv
+            git add data/latest.csv || true
+          fi
+
+          # commit updated seen_slugs.json
+          if [ -f seen_slugs.json ]; then
+            git add seen_slugs.json || true
+          fi
+
+          git commit -m "ci: update latest YC CSV & seen_slugs $(date -u +%Y%m%d_%H%M%S)" || echo "no changes to commit"
+          git push || echo "push failed"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+ 
+
       - name: Upload results artifact
         uses: actions/upload-artifact@v4
         with:
