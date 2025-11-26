@@ -42,8 +42,8 @@ jobs:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           BATCH_SLUG: ${{ secrets.BATCH_SLUG }}
           REQUEST_DELAY: "0.8"
-          FORCE_PROCESS: ${{ inputs.force }}
-          USE_PLAYWRIGHT: ${{ inputs.force }}
+          FORCE_PROCESS: "false"            # keep false by default for scheduled runs
+          USE_PLAYWRIGHT: "true"            # ENABLE Playwright for scheduled runs
         run: |
           echo "$GCP_SA_KEY_JSON" > sa.json
           python yc_daily_tracker.py
