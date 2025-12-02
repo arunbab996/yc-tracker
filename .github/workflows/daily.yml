@@ -23,30 +23,28 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 python-dateutil gspread google-auth
-          pip install playwright
+          pip install requests beautifulsoup4 python-dateutil gspread google-auth playwright
           playwright install chromium
 
       - name: Prepare service account file
+        env:
+          GCP_SA_KEY_JSON: ${{ secrets.GCP_SA_KEY_JSON }}
         run: |
-          if [ -n "${{ secrets.GCP_SA_KEY_JSON }}" ]; then
-            echo "Writing sa.json from secret"
-            echo "${{ secrets.GCP_SA_KEY_JSON }}" > sa.json
+          if [ -n "$GCP_SA_KEY_JSON" ]; then
+            echo "$GCP_SA_KEY_JSON" > sa.json
             wc -c sa.json || true
           else
             echo "GCP_SA_KEY_JSON secret not provided — skipping sa.json write"
           fi
 
-      # ===========================
-      # 1) SCHEDULED RUN (CRON)
-      # ===========================
+      # ============ SCHEDULED (CRON) RUN ============
       - name: Run YC tracker (scheduled daily)
         if: github.event_name == 'schedule'
         env:
@@ -57,14 +55,9 @@ jobs:
           FORCE_PROCESS: "false"
           USE_PLAYWRIGHT: "true"
         run: |
-          if [ -n "$GCP_SA_KEY_JSON" ]; then
-            echo "$GCP_SA_KEY_JSON" > sa.json
-          fi
           python yc_daily_tracker.py
 
-      # ===========================
-      # 2) MANUAL RUN — NORMAL
-      # ===========================
+      # ============ MANUAL RUN — NORMAL ============
       - name: Run YC tracker (manual normal)
         if: github.event_name == 'workflow_dispatch' && github.event.inputs.debug == 'false'
         env:
@@ -75,14 +68,9 @@ jobs:
           FORCE_PROCESS: "false"
           USE_PLAYWRIGHT: "true"
         run: |
-          if [ -n "$GCP_SA_KEY_JSON" ]; then
-            echo "$GCP_SA_KEY_JSON" > sa.json
-          fi
           python yc_daily_tracker.py
 
-      # ===========================
-      # 3) MANUAL RUN — DEBUG
-      # ===========================
+      # ============ MANUAL RUN — DEBUG ============
       - name: Run YC tracker (manual debug)
         if: github.event_name == 'workflow_dispatch' && github.event.inputs.debug == 'true'
         env:
@@ -98,10 +86,6 @@ jobs:
           ls -la
           find . -maxdepth 2 -type f -print || true
           python --version
-          if [ -n "$GCP_SA_KEY_JSON" ]; then
-            echo "$GCP_SA_KEY_JSON" > sa.json
-            wc -c sa.json || true
-          fi
           python yc_daily_tracker.py
           echo "=== DEBUG END ==="
 
@@ -121,18 +105,22 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+          # find newest CSV in results/
           LATEST_CSV=$(ls -t results/yc_new_* 2>/dev/null | head -n1 || true)
 
+          # copy it to data/latest.csv
           if [ -n "$LATEST_CSV" ]; then
             mkdir -p data
             cp "$LATEST_CSV" data/latest.csv
             git add data/latest.csv || true
           fi
 
+          # commit updated seen_slugs.json if present
           if [ -f seen_slugs.json ]; then
             git add seen_slugs.json || true
           fi
 
+          # Only commit if there are changes
           if git diff --cached --quiet; then
             echo "No changes to commit"
           else
