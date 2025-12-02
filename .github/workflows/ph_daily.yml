@@ -1,0 +1,52 @@
+name: Daily Product Hunt Tracker
+
+on:
+  schedule:
+    - cron: "40 2 * * *"   # runs daily at 02:40 UTC (after YC's 02:30 if you keep that)
+  workflow_dispatch: {}
+
+jobs:
+  run-ph-tracker:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests gspread google-auth
+
+      - name: Prepare service account file (optional, same pattern as YC)
+        env:
+          GCP_SA_KEY_JSON: ${{ secrets.GCP_SA_KEY_JSON }}
+        run: |
+          if [ -n "$GCP_SA_KEY_JSON" ]; then
+            echo "$GCP_SA_KEY_JSON" > sa.json
+            wc -c sa.json || true
+          else
+            echo "GCP_SA_KEY_JSON secret not provided — skipping sa.json write"
+          fi
+
+      - name: Run Product Hunt tracker
+        env:
+          GCP_SA_KEY_JSON: ${{ secrets.GCP_SA_KEY_JSON }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          PRODUCT_HUNT_TOKEN: ${{ secrets.PRODUCT_HUNT_TOKEN }}
+          PH_WORKSHEET_NAME: "Product Hunt Data"
+          PH_LIMIT: "30"
+        run: |
+          python ph_daily_tracker.py
+
+      - name: Upload PH results artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ph-results
+          path: results/
+          if-no-files-found: warn
